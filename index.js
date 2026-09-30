@@ -1,181 +1,71 @@
 import { writeFile, mkdir } from 'fs/promises'; // File System access via promises
-import { existsSync } from 'fs'; // File System
-import axios from 'axios'; // HTTP client
 import { resolve } from 'path'; // Easier directory path handling
-import { authenticate } from '@google-cloud/local-auth'; // Google Authentication Library
 import csv from 'csvtojson'; // Convert CSV to JSON
-import moment from 'moment'; // Handle dates
-import { parse } from 'json2csv'; // Convert JSON to CSV
+import { parseArgs, inspectUrl, runBatch, exitCodeFor, flatRow, toCsv } from './lib.js';
+import { hasRefreshEnv, refreshTokenCredentials } from './auth.js';
 
-// Variables
-const endpoint = 'https://searchconsole.googleapis.com/v1/urlInspection/index:inspect';
-const folder = 'RESULTS'; // Name of the folder (change to an appropriate name)
-const file = './urls.csv'; // File to add URLs
-const chunkNum = 20; // Break URL list into chunks to prevent API errors
-const test = {
-  inspectionUrl: 'https://jlhernando.com/blog/how-to-install-node-for-seo/',
-  siteUrl: 'https://jlhernando.com/',
-}; // Testing object
-
-// Create results folder
-existsSync(`./${folder}/`) ? console.log(`${folder} folder exists`) : mkdir(`${folder}`);
+// Arguments (clear-adapt): --urls <csv> --out <dir> --property <siteUrl> --budget <n>
+//   --concurrency <n> --spacing <ms> --unattended --client-secret <path>
+const args = parseArgs(process.argv.slice(2));
+const folder = args.out || process.env.INSPECT_OUT || 'RESULTS';
+const file = args.urls || process.env.INSPECT_URLS || './urls.csv';
+const defaultProperty = args.property || process.env.INSPECT_PROPERTY || '';
+const budget = args.budget ? Number(args.budget) : Infinity;
+const concurrency = Number(args.concurrency || 5);
+const spacingMs = Number(args.spacing ?? 200);
 
 // Custom function to read URLs file
 const readUrls = async (f) => csv().fromFile(f);
 
-// Custom function to extract data from API
-const getData = async (inspectionUrl, siteUrl, authToken) => {
-  // Construct data object to send to API
-  const body = {
-    inspectionUrl,
-    siteUrl,
-  };
-
-  const { data } = await axios({
-    method: 'post',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'application/json',
-      Authorization: `Bearer ${authToken}`,
-    },
-    url: endpoint,
-    data: body,
-  });
-  return data;
-};
-
 // Custom functions to get oAuth credentials from Google
 const getCredentials = async () => {
+  if (hasRefreshEnv()) return refreshTokenCredentials();
+  if (args.unattended) throw new Error('--unattended set but GSC_CLIENT_ID/GSC_CLIENT_SECRET/GSC_REFRESH_TOKEN are missing');
+  const { authenticate } = await import('@google-cloud/local-auth');
   const { credentials } = await authenticate({
-    keyfilePath: resolve('client-secret-REAL.json'),
-    scopes: ['https://www.googleapis.com/auth/webmasters'],
+    keyfilePath: resolve(args['client-secret'] || 'client-secret-REAL.json'),
+    scopes: ['https://www.googleapis.com/auth/webmasters.readonly'],
   });
   return credentials;
 };
 
-// Authenticated Request Function
-(async () => {
-  // Start timer
-  console.time();
+async function main() {
+  console.time('inspect');
+  await mkdir(folder, { recursive: true });
 
-  // Get URLs from file
-  const urls = await readUrls(file);
+  const urls = (await readUrls(file)).map((r) => ({ url: r.url, property: r.property || defaultProperty }));
 
-  // Store data from API
-  const data = [];
-  const errors = [];
+  console.log('Authenticating...');
+  let credentials;
+  try {
+    credentials = await getCredentials();
+  } catch (err) {
+    console.error('FAILED TO AUTHENTICATE USER:', err.message);
+    return exitCodeFor({ authFailed: true });
+  }
+  console.log(`Success authenticating user; ${urls.length} URLs, budget ${budget}`);
 
-  // Start counter to inform user
-  let counter = 1;
-  const totalChunks = Math.ceil(urls.length / chunkNum);
-
-  // Obtain user credentials to use for the request (pop up authentication)
-  console.log('Athenticating...');
-  const credentials = await getCredentials().catch((err) => {
-    console.log(
-      'FAILED TO AUTHENTICATE USER. Check if your Google account has access to the requested url/property or if your credential-secret.json is correct',
-      err
-    );
-    process.exit();
+  const result = await runBatch(urls, {
+    inspect: (u, p) => inspectUrl(u, p, credentials.access_token),
+    concurrency,
+    spacingMs,
+    budget,
+    log: (m) => console.log(m),
   });
 
-  console.log('Success authenticating user');
+  // Output shape kept from upstream: coverage.json, coverage.csv, errors.json (+ remaining.csv)
+  await writeFile(`${folder}/coverage.json`, JSON.stringify(result.data, null, 2));
+  await writeFile(`${folder}/coverage.csv`, result.data.length ? toCsv(result.data.map(flatRow)) : 'url\n');
+  await writeFile(`${folder}/errors.json`, JSON.stringify(result.errors, null, 2));
+  await writeFile(`${folder}/remaining.csv`, toCsv(result.remaining, ['url', 'property']));
+  await writeFile(`${folder}/summary.json`, JSON.stringify({
+    inspected: result.data.length, errors: result.errors.length, remaining: result.remaining.length,
+    attempts: result.attempts, quotaHit: result.quotaHit, budgetHit: result.budgetHit,
+  }, null, 2));
 
-  while (urls.length) {
-    // Inform user of number of batches remaining
-    console.log(`###### Requesting batch ${counter} of ${totalChunks} ######`);
+  console.log(`Retrieved Indexing status for ${result.data.length} URLs, ${result.errors.length} errors, ${result.remaining.length} remaining, ${result.attempts} attempts`);
+  console.timeEnd('inspect');
+  return exitCodeFor({ quotaHit: result.quotaHit, fatal: urls.length > 0 && result.data.length === 0 && result.errors.length > 0 });
+}
 
-    // Get chunk of URLs files
-    const chunk = urls.splice(0, chunkNum);
-
-    // Create batch of promises (array)
-    const promises = chunk.map(({ url, property }) => getData(url, property, credentials.access_token));
-
-    // Send all requests in parallel
-    const rawBatchResults = await Promise.allSettled(promises);
-
-    // Filter data from batch response
-    const fulfilled = rawBatchResults.filter(({ status }) => status === 'fulfilled');
-    const rejected = rawBatchResults.filter(({ status }) => status === 'rejected');
-
-    // If any api call fails push errors to array
-    if (rejected) {
-      const rejectedUrls = rejected.map(({ reason }) => {
-        const { inspectionUrl } = JSON.parse(reason.config.data);
-        return inspectionUrl;
-      });
-      errors.push(...rejectedUrls);
-    }
-
-    // Process fulfilled requests
-    if (fulfilled) {
-      fulfilled.map(({ value }, index) => {
-        // Create object from response
-        const inspection = value;
-
-        // Log progress with results
-        console.log(
-          `Batch ${counter} -> ${chunk[index].url}: ${JSON.stringify(
-            value.inspectionResult.indexStatusResult.coverageState
-          )}`
-        );
-
-        // Add URL to object
-        inspection.url = chunk[index].url;
-
-        // Push to store data
-        data.push(inspection);
-      });
-    }
-    counter++;
-  }
-
-  // Write results to JSON
-  if (data.length) {
-    writeFile(`./${folder}/coverage.json`, JSON.stringify(data, null, 2));
-
-    // Transform JSON to ideal CSV
-    const output = data.map(({ url, inspectionResult: { indexStatusResult } }) => {
-      const cleanObj = {
-        url,
-        verdict: indexStatusResult.verdict,
-        coverageState: indexStatusResult.coverageState,
-        'Crawl allowed?': indexStatusResult.robotsTxtState,
-        'Indexing allowed?': indexStatusResult.indexingState,
-        'Last crawl':
-          indexStatusResult.lastCrawlTime === '1970-01-01T00:00:00Z'
-            ? 'Not crawled'
-            : moment(indexStatusResult.lastCrawlTime).format('YYYY-MM-DD HH:mm:ss'),
-        'Page fetch': indexStatusResult.pageFetchState,
-        'User-declared canonical': indexStatusResult?.userCanonical ?? 'No User-declared canonical',
-        'Google-selected canonical': indexStatusResult?.googleCanonical ?? 'Inspected URL',
-      };
-
-      if (indexStatusResult.sitemap) {
-        for (const [index, sitemap] of indexStatusResult.sitemap.entries()) {
-          cleanObj[`sitemap-${index + 1}`] = sitemap;
-        }
-      }
-
-      if (indexStatusResult.referringUrls) {
-        for (const [index, refUrl] of indexStatusResult.referringUrls.entries()) {
-          cleanObj[`referringUrl-${index + 1}`] = refUrl;
-        }
-      }
-      return cleanObj;
-    });
-
-    // Write transformed data to CSV
-    writeFile(`./${folder}/coverage.csv`, parse(output));
-  }
-
-  // Write URLs that have failed
-  if (errors.length) {
-    writeFile(`./${folder}/errors.json`, JSON.stringify(errors, null, 2));
-  }
-
-  // Final message
-  console.log(`Retrieved Indexing status for ${data.length} URLs & encountered ${errors.length} errors`);
-
-  console.timeEnd();
-})();
+main().then((code) => process.exit(code), (err) => { console.error(err); process.exit(1); });
